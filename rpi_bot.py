@@ -856,6 +856,27 @@ class RPIBot:
 
         return True, ""
 
+    async def _cleanup_residual_positions(self, market: str) -> bool:
+        """清理残留仓位（部分成交遗留）"""
+        positions = await self.client.get_positions(market)
+        if not positions:
+            return False
+        for pos in positions:
+            size = float(pos.get("size", 0))
+            if size < 0.00001:
+                continue
+            side = pos.get("side", "")
+            close_side = "SELL" if side == "LONG" else "BUY"
+            log.warning(f"[清理残留] 发现残留仓位: {side} {size:.5f} BTC, 市价平仓")
+            result = await self.client.place_market_order(market, close_side, str(size), reduce_only=True)
+            if result:
+                self._record_trade()
+                log.info(f"[清理残留] 已平仓 {close_side} {size:.5f} BTC")
+            else:
+                log.error(f"[清理残留] 平仓失败!")
+            return True
+        return False
+
     async def _execute_trade(self, direction: str, market: str, size: str, bid: float, ask: float,
                               stop_loss_pct: float, take_profit_pct: float) -> tuple:
         """
@@ -932,14 +953,20 @@ class RPIBot:
                     break
                 else:
                     log.info(f"[开仓] 限价单超时未成交, 已撤单 (尝试 {attempt + 1}/{self.config.entry_requote_max + 1})")
+                    # 清理可能的部分成交残留仓位
+                    await self._cleanup_residual_positions(market)
 
             # 限价单全部失败, 检查是否允许fallback到市价单
             if not open_result:
                 current_spread_pct = (ask - bid) / bid * 100
                 if current_spread_pct > self.config.market_spread_limit_pct:
+                    # Maker入场完全失败，清理所有残留仓位
+                    await self._cleanup_residual_positions(market)
                     log.warning(f"[开仓] Maker入场失败, 当前spread={current_spread_pct:.4f}% > 限制{self.config.market_spread_limit_pct:.4f}%, 禁止吃单")
                     return False, "maker_failed_spread_too_wide", 0
                 else:
+                    # Taker fallback前先清理残留
+                    await self._cleanup_residual_positions(market)
                     log.info(f"[开仓] Maker入场失败, spread={current_spread_pct:.4f}% <= {self.config.market_spread_limit_pct:.4f}%, 允许Taker fallback")
 
         # 市价单入场 (原始逻辑或Maker失败后的fallback)
@@ -1176,6 +1203,11 @@ class RPIBot:
         """执行一个 RPI 交易周期 - 支持双向交易"""
         market = self.config.market
         base_size = self.config.trade_size
+
+        # 兜底：清理上一周期可能遗留的残留仓位
+        if await self._cleanup_residual_positions(market):
+            log.info("[周期] 已清理上一周期残留仓位，等待后继续")
+            await asyncio.sleep(1)
 
         # 限速检查
         can_trade, reason, usage = self._can_trade()
