@@ -439,7 +439,7 @@ class ParadexInteractiveClient:
             if not await self.ensure_authenticated():
                 return None
             import aiohttp
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
                 async with session.get(f"{self.base_url}/orders/{order_id}", headers=self._get_auth_headers()) as resp:
                     if resp.status == 200:
                         return await resp.json()
@@ -1052,12 +1052,16 @@ class RPIBot:
         maker_exit_place_time = 0
         maker_exit_limit_price = 0.0
 
+        maker_filled_size = 0.0
+        maker_filled_price = 0.0
+
         if self.config.max_wait_seconds <= 0:
             log.info("[极速] 立即平仓模式")
         else:
             wait_start = time.time()
             max_wait = self.config.max_wait_seconds
             extension_used = False
+            last_maker_order_check = 0
 
             while time.time() - wait_start < max_wait:
                 if _shutdown_requested:
@@ -1142,16 +1146,20 @@ class RPIBot:
                             and not maker_exit_placed
                             and elapsed >= max_wait - self.config.maker_exit_window):
                         tick_size = 0.1
+                        remaining_to_close = float(size) - maker_filled_size
                         if is_long:
-                            maker_exit_limit_price = new_bbo["ask"] + self.config.maker_exit_price_offset * tick_size
+                            maker_exit_limit_price = new_bbo["ask"] - self.config.maker_exit_price_offset * tick_size
                         else:
-                            maker_exit_limit_price = new_bbo["bid"] - self.config.maker_exit_price_offset * tick_size
+                            maker_exit_limit_price = new_bbo["bid"] + self.config.maker_exit_price_offset * tick_size
 
                         bbo_key = "ask" if is_long else "bid"
-                        log.info(f"[Maker退出] 挂限价平仓单: {'SELL' if is_long else 'BUY'} {size} BTC @ ${maker_exit_limit_price:.1f} (best_{bbo_key}={new_bbo[bbo_key]:.1f}, offset={self.config.maker_exit_price_offset})")
+                        remaining_time = max_wait - elapsed
+                        log.info(f"[Maker退出] 挂限价平仓单: {'SELL' if is_long else 'BUY'} {size} BTC @ ${maker_exit_limit_price:.1f} "
+                                 f"(best_{bbo_key}={new_bbo[bbo_key]:.1f}, offset={self.config.maker_exit_price_offset}) "
+                                 f"[已持仓 {elapsed:.1f}s, 距timeout {remaining_time:.1f}s]")
 
                         maker_exit_result = await self.client.place_limit_order(
-                            market=market, side=close_side, size=size,
+                            market=market, side=close_side, size=str(round(remaining_to_close, 5)),
                             price=str(round(maker_exit_limit_price, 1)),
                             post_only=True, reduce_only=True
                         )
@@ -1163,17 +1171,68 @@ class RPIBot:
                         else:
                             log.warning("[Maker退出] 挂单失败，将在timeout后市价平仓")
 
-                    # === v3.4 检查Maker平仓单是否成交 ===
+                    # === v3.4 检查Maker平仓单是否成交 + 追价 ===
                     if maker_exit_placed and maker_exit_order_id:
-                        order_info = await self.client.get_order_status(maker_exit_order_id)
-                        if order_info:
-                            order_status = order_info.get("status")
-                            remaining_qty = float(order_info.get("remaining_size", size))
-                            if order_status == "CLOSED" and remaining_qty < 0.00001:
-                                wait_seconds = time.time() - maker_exit_place_time
-                                log.info(f"[Maker退出] 限价平仓单已全部成交 (等待 {wait_seconds:.1f}s)")
-                                exit_reason = "maker_close"
-                                break
+                        now = time.time()
+                        if now - last_maker_order_check >= 1.0:
+                            last_maker_order_check = now
+                            order_info = await self.client.get_order_status(maker_exit_order_id)
+                            if order_info:
+                                order_status = order_info.get("status")
+                                remaining_qty = float(order_info.get("remaining_size", size))
+
+                                # 已全部成交
+                                if order_status == "CLOSED" and remaining_qty < 0.00001:
+                                    wait_seconds = time.time() - maker_exit_place_time
+                                    log.info(f"[Maker退出] 限价平仓单已全部成交 (等待 {wait_seconds:.1f}s)")
+                                    exit_reason = "maker_close"
+                                    break
+
+                                # 仍在挂单中 → 检查是否需要追价
+                                if order_status == "OPEN" and new_bbo:
+                                    tick_size = 0.1
+                                    if is_long:
+                                        new_target_price = new_bbo["ask"] - self.config.maker_exit_price_offset * tick_size
+                                    else:
+                                        new_target_price = new_bbo["bid"] + self.config.maker_exit_price_offset * tick_size
+
+                                    # 价格偏离超过1个tick时追价（撤单重挂）
+                                    if abs(new_target_price - maker_exit_limit_price) >= tick_size:
+                                        log.info(f"[Maker退出] 盘口移动, 追价: ${maker_exit_limit_price:.1f} -> ${new_target_price:.1f}")
+                                        await self.client.cancel_order(maker_exit_order_id)
+                                        await asyncio.sleep(0.3)
+
+                                        # 检查取消时是否已部分/全部成交
+                                        cancel_check = await self.client.get_order_status(maker_exit_order_id)
+                                        if cancel_check:
+                                            cancel_remaining = float(cancel_check.get("remaining_size", size))
+                                            if cancel_remaining < 0.00001:
+                                                log.info(f"[Maker退出] 追价取消时发现已全部成交")
+                                                exit_reason = "maker_close"
+                                                break
+
+                                            original_qty = float(cancel_check.get("size", size))
+                                            cancel_filled = original_qty - cancel_remaining
+                                            if cancel_filled >= 0.00001:
+                                                maker_filled_size += cancel_filled
+                                                maker_filled_price = float(cancel_check.get("avg_fill_price", maker_exit_limit_price))
+
+                                        # 重新挂单（用剩余数量）
+                                        remaining_to_close = float(size) - maker_filled_size
+                                        if remaining_to_close >= 0.00001:
+                                            new_order_result = await self.client.place_limit_order(
+                                                market=market, side=close_side,
+                                                size=str(round(remaining_to_close, 5)),
+                                                price=str(round(new_target_price, 1)),
+                                                post_only=True, reduce_only=True
+                                            )
+                                            if new_order_result:
+                                                maker_exit_order_id = new_order_result.get("id")
+                                                maker_exit_limit_price = new_target_price
+                                                log.info(f"[Maker退出] 重挂限价平仓单 @ ${new_target_price:.1f}")
+                                            else:
+                                                log.warning(f"[Maker退出] 追价重挂失败，等待timeout后Taker兜底")
+                                                maker_exit_order_id = None
 
                     # 智能持仓延长
                     elapsed = time.time() - wait_start
@@ -1219,15 +1278,34 @@ class RPIBot:
                 is_maker_exit = True
                 self.maker_exit_success += 1
             else:
-                # TP/SL/shutdown/timeout触发，取消Maker退出单
+                # TP/SL/shutdown/timeout触发，取消Maker退出单（带重试）
                 log.info(f"[Maker退出] {exit_reason}触发，取消限价平仓单")
-                await self.client.cancel_order(maker_exit_order_id)
-                # 查询取消后的订单状态（可能已部分成交）
+                cancel_success = False
+                for cancel_attempt in range(3):
+                    if await self.client.cancel_order(maker_exit_order_id):
+                        cancel_success = True
+                        break
+                    await asyncio.sleep(0.3)
+
+                # 等待交易所状态同步后查询
+                await asyncio.sleep(0.5)
                 order_info = await self.client.get_order_status(maker_exit_order_id)
                 if order_info:
+                    order_status = order_info.get("status")
                     original_qty = float(order_info.get("size", size))
                     remaining_qty = float(order_info.get("remaining_size", size))
                     maker_filled_size = original_qty - remaining_qty
+
+                    # 取消失败且订单仍在，强制重试
+                    if order_status == "OPEN":
+                        log.warning(f"[Maker退出] 取消失败，订单仍OPEN，强制重试取消")
+                        await self.client.cancel_order(maker_exit_order_id)
+                        await asyncio.sleep(1.0)
+                        order_info = await self.client.get_order_status(maker_exit_order_id)
+                        if order_info:
+                            remaining_qty = float(order_info.get("remaining_size", size))
+                            maker_filled_size = original_qty - remaining_qty
+
                     if maker_filled_size >= 0.00001:
                         maker_filled_price = float(order_info.get("avg_fill_price", maker_exit_limit_price))
                         log.info(f"[Maker退出] 取消时已部分成交 {maker_filled_size:.5f}/{size} BTC @ ${maker_filled_price:.1f}")
@@ -1255,9 +1333,9 @@ class RPIBot:
                 exit_bbo = await self.client.get_bbo(market)
                 if exit_bbo:
                     if is_long:
-                        exit_limit_price = exit_bbo["ask"] + self.config.exit_price_offset_ticks * tick_size
+                        exit_limit_price = exit_bbo["ask"] - self.config.exit_price_offset_ticks * tick_size
                     else:
-                        exit_limit_price = exit_bbo["bid"] - self.config.exit_price_offset_ticks * tick_size
+                        exit_limit_price = exit_bbo["bid"] + self.config.exit_price_offset_ticks * tick_size
                 else:
                     exit_limit_price = best_price
 
