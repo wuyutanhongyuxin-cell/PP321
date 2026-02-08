@@ -34,6 +34,13 @@ v3.4 新增功能 (Maker优先退出):
     - 完整的exit_reason追踪和出场Maker率统计
     - 可配置: MAKER_EXIT_ENABLED开关支持A/B测试
 
+v3.5 新增功能 (自适应止盈止损):
+    - ATR计算: 基于BBO快照的实时波动率测量
+    - 自适应止盈止损: TP/SL = ATR × 方向独立倍数 (替代固定R/R)
+    - 做多/做空独立参数: 信号阈值、RSI阈值、TP/SL倍数均可分开配置
+    - 钳位保护: 防止极端波动率导致过大/过小的止盈止损
+    - A/B测试: ADAPTIVE_STOPLOSS=false 完全回退到v3.4原有逻辑
+
 基于 pp2 项目改进: https://github.com/wuyutanhongyuxin-cell/pp2
 """
 
@@ -157,6 +164,33 @@ class RPIConfig:
     drawdown_control_enabled: bool = True
     max_daily_loss_pct: float = 0.03
     max_total_loss_pct: float = 0.10
+
+    # ===== v3.5 自适应止盈止损 =====
+    adaptive_stoploss: bool = False
+    atr_window: int = 25
+    atr_sample_interval: float = 0.3
+
+    # 做多 ATR 倍数
+    long_sl_atr_mult: float = 1.2
+    long_tp_atr_mult: float = 1.8
+
+    # 做空 ATR 倍数
+    short_sl_atr_mult: float = 1.0
+    short_tp_atr_mult: float = 2.2
+
+    # 自适应钳位
+    adaptive_sl_min: float = 0.005
+    adaptive_sl_max: float = 0.020
+    adaptive_tp_min: float = 0.008
+    adaptive_tp_max: float = 0.040
+
+    # ===== v3.5 多空独立方向信号阈值 =====
+    long_signal_threshold: float = 0.0    # 0 = 使用 direction_signal_threshold
+    short_signal_threshold: float = 0.0   # 0 = 使用 direction_signal_threshold
+
+    # ===== v3.5 多空独立 RSI 阈值 =====
+    rsi_long_threshold: float = 0.0       # 0 = 使用 rsi_trend_threshold
+    rsi_short_threshold: float = 0.0      # 0 = 使用 rsi_trend_threshold
 
     # ===== v3.4 Maker优先退出配置 =====
     maker_exit_enabled: bool = True
@@ -742,9 +776,67 @@ class RPIBot:
         slope_pct = (slope / avg_price) * 100
         return slope_pct
 
+    async def _calculate_atr(self, market: str, n_samples: int = 25,
+                              sample_interval: float = 0.3) -> Optional[float]:
+        """
+        计算 ATR (Average True Range) 百分比
+
+        基于连续BBO快照计算，不依赖外部K线API。
+        每个采样点取 mid_price = (bid+ask)/2，
+        TR = |current_mid - prev_mid| (简化版，tick级别无high/low)
+        ATR = mean(TR) / mean(price) * 100  → 百分比
+
+        Args:
+            market: 交易市场
+            n_samples: 采样点数 (默认25，约7.5秒)
+            sample_interval: 采样间隔秒数
+
+        Returns:
+            ATR百分比 (如 0.005 表示 0.005%)，或 None
+        """
+        prices = []
+        for i in range(n_samples):
+            bbo = await self.client.get_bbo(market)
+            if bbo:
+                mid = (bbo["bid"] + bbo["ask"]) / 2
+                prices.append(mid)
+            if i < n_samples - 1:
+                await asyncio.sleep(sample_interval)
+
+        if len(prices) < 5:
+            return None
+
+        # 计算 True Range 序列
+        true_ranges = []
+        for i in range(1, len(prices)):
+            tr = abs(prices[i] - prices[i - 1])
+            true_ranges.append(tr)
+
+        if not true_ranges:
+            return None
+
+        atr = sum(true_ranges) / len(true_ranges)
+        avg_price = sum(prices) / len(prices)
+
+        if avg_price == 0:
+            return None
+
+        atr_pct = atr / avg_price * 100  # 转为百分比
+
+        # 同时更新 price_history 供 RSI 等使用
+        self.price_history.extend(prices)
+        if len(self.price_history) > 100:
+            self.price_history = self.price_history[-100:]
+
+        return atr_pct
+
     def _is_signal_confirmed(self, prices: List[float], direction: str) -> tuple:
         """确认入场信号 (RSI过滤 + 动量过滤) - 支持做多和做空"""
         rsi = self._calculate_rsi(prices, self.config.rsi_period)
+
+        # v3.5: 多空独立RSI阈值
+        rsi_long_thresh = self.config.rsi_long_threshold if self.config.rsi_long_threshold > 0 else self.config.rsi_trend_threshold
+        rsi_short_thresh = self.config.rsi_short_threshold if self.config.rsi_short_threshold > 0 else self.config.rsi_trend_threshold
 
         # 动量计算
         momentum_window = min(self.config.price_momentum_window, len(prices))
@@ -774,7 +866,7 @@ class RPIBot:
 
         if self.config.entry_mode == "trend":
             if direction == "LONG":
-                if rsi > self.config.rsi_trend_threshold:
+                if rsi > rsi_long_thresh:
                     # 动量检查
                     if self.config.price_momentum_min_slope > 0 and slope_pct_val < self.config.price_momentum_min_slope:
                         log.info(f"[信号过滤] RSI={rsi:.1f} 满足, 但 slope_pct={slope_pct_val:.4f}% < {self.config.price_momentum_min_slope}% 动量不足")
@@ -782,11 +874,11 @@ class RPIBot:
                     # RSI和动量均满足，确认做多
                     log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做多条件，确认入场")
                     return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做多确认"
-                log.info(f"[信号过滤] RSI={rsi:.1f} < {self.config.rsi_trend_threshold}，不满足做多")
-                return False, f"RSI={rsi:.1f} 低于阈值"
+                log.info(f"[信号过滤] RSI={rsi:.1f} < {rsi_long_thresh}，不满足做多")
+                return False, f"RSI={rsi:.1f} 低于阈值{rsi_long_thresh}"
 
             elif direction == "SHORT":
-                if rsi < self.config.rsi_trend_threshold:
+                if rsi < rsi_short_thresh:
                     # 动量检查 (做空需要负斜率)
                     if self.config.price_momentum_min_slope > 0 and slope_pct_val > -self.config.price_momentum_min_slope:
                         log.info(f"[信号过滤] RSI={rsi:.1f} 满足, 但 slope_pct={slope_pct_val:.4f}% > -{self.config.price_momentum_min_slope}% 动量不足")
@@ -794,8 +886,8 @@ class RPIBot:
                     # RSI和动量均满足，确认做空
                     log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做空条件，确认入场")
                     return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做空确认"
-                log.info(f"[信号过滤] RSI={rsi:.1f} > {self.config.rsi_trend_threshold}，不满足做空")
-                return False, f"RSI={rsi:.1f} 高于阈值"
+                log.info(f"[信号过滤] RSI={rsi:.1f} > {rsi_short_thresh}，不满足做空")
+                return False, f"RSI={rsi:.1f} 高于阈值{rsi_short_thresh}"
 
         elif self.config.entry_mode == "mean_reversion":
             if direction == "LONG" and rsi < self.config.rsi_oversold:
@@ -864,13 +956,17 @@ class RPIBot:
         return True, ""
 
     def _get_direction_signal(self, imbalance: Optional[float]) -> tuple:
-        """获取方向信号 - 支持做多和做空"""
+        """获取方向信号 - 支持做多和做空，v3.5支持独立阈值"""
         if imbalance is None:
             return "NEUTRAL", 0.0
-        threshold = self.config.direction_signal_threshold
-        if imbalance > threshold:
+
+        # v3.5: 多空独立阈值 (为0时使用统一阈值)
+        long_thresh = self.config.long_signal_threshold if self.config.long_signal_threshold > 0 else self.config.direction_signal_threshold
+        short_thresh = self.config.short_signal_threshold if self.config.short_signal_threshold > 0 else self.config.direction_signal_threshold
+
+        if imbalance > long_thresh:
             return "LONG", abs(imbalance)
-        elif imbalance < -threshold:
+        elif imbalance < -short_thresh:
             return "SHORT", abs(imbalance)
         return "NEUTRAL", abs(imbalance)
 
@@ -1497,6 +1593,38 @@ class RPIBot:
                 if new_bbo:
                     ask = new_bbo["ask"]
 
+        # v3.5 ATR 采样 (自适应止盈止损)
+        atr_pct = None
+        if self.config.adaptive_stoploss:
+            if self.config.volatility_filter_enabled:
+                # 波动率检测已经采样了价格，用 price_history 计算 ATR（避免重复采样）
+                if len(self.price_history) >= 5:
+                    recent = self.price_history[-self.config.atr_window:]
+                    trs = [abs(recent[i] - recent[i-1]) for i in range(1, len(recent))]
+                    if trs:
+                        avg_price = sum(recent) / len(recent)
+                        atr_pct = (sum(trs) / len(trs)) / avg_price * 100 if avg_price > 0 else None
+                if atr_pct is not None:
+                    log.info(f"[ATR] 从波动率采样数据计算: ATR={atr_pct:.5f}% (样本={min(len(self.price_history), self.config.atr_window)})")
+
+            if atr_pct is None:
+                # 波动率检测关闭或数据不足，独立采样
+                log.info(f"[ATR] 独立采样中 (窗口={self.config.atr_window}, 间隔={self.config.atr_sample_interval}s)")
+                atr_pct = await self._calculate_atr(
+                    market,
+                    n_samples=self.config.atr_window,
+                    sample_interval=self.config.atr_sample_interval
+                )
+                if atr_pct is not None:
+                    log.info(f"[ATR] 独立采样完成: ATR={atr_pct:.5f}%")
+                else:
+                    log.warning("[ATR] 采样失败，本周期回退到固定止盈止损")
+
+                # 独立采样后需要刷新 BBO（价格可能已变化）
+                new_bbo = await self.client.get_bbo(market)
+                if new_bbo:
+                    bid, ask = new_bbo["bid"], new_bbo["ask"]
+
         # 获取方向信号
         imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
         direction, confidence = self._get_direction_signal(imbalance)
@@ -1629,15 +1757,40 @@ class RPIBot:
             return False, f"余额不足: {balance:.2f} < {required:.2f}"
 
         # 计算止损止盈
-        if self.config.dynamic_stop_loss:
-            dynamic_stop = spread_pct * self.config.stop_loss_spread_multiplier
-            stop_loss_pct = max(self.config.dynamic_stop_loss_min, min(dynamic_stop, self.config.dynamic_stop_loss_max))
-            log.info(f"[开仓] 动态止损={stop_loss_pct*100:.2f}% (spread={spread_pct:.4f}% x {self.config.stop_loss_spread_multiplier}, 范围={self.config.dynamic_stop_loss_min*100:.1f}%-{self.config.dynamic_stop_loss_max*100:.1f}%)")
-        else:
-            stop_loss_pct = self.config.stop_loss_pct
+        if self.config.adaptive_stoploss and atr_pct is not None:
+            # v3.5 自适应模式: 基于 ATR + 方向独立倍数
+            if direction == "LONG":
+                raw_sl = atr_pct * self.config.long_sl_atr_mult
+                raw_tp = atr_pct * self.config.long_tp_atr_mult
+                sl_mult_str = f"ATR\u00d7{self.config.long_sl_atr_mult}"
+                tp_mult_str = f"ATR\u00d7{self.config.long_tp_atr_mult}"
+            else:
+                raw_sl = atr_pct * self.config.short_sl_atr_mult
+                raw_tp = atr_pct * self.config.short_tp_atr_mult
+                sl_mult_str = f"ATR\u00d7{self.config.short_sl_atr_mult}"
+                tp_mult_str = f"ATR\u00d7{self.config.short_tp_atr_mult}"
 
-        take_profit_pct = stop_loss_pct * self.config.risk_reward_ratio
-        log.info(f"[开仓] 止盈={take_profit_pct*100:.2f}%, 止损={stop_loss_pct*100:.2f}% (R/R={self.config.risk_reward_ratio})")
+            # 钳位 (注意: atr_pct 已经是百分比，但 stop_loss_pct / take_profit_pct 是小数比例)
+            # 所以 raw_sl / raw_tp 是百分比值，需要 / 100 转为比例
+            stop_loss_pct = max(self.config.adaptive_sl_min, min(raw_sl / 100, self.config.adaptive_sl_max))
+            take_profit_pct = max(self.config.adaptive_tp_min, min(raw_tp / 100, self.config.adaptive_tp_max))
+
+            effective_rr = take_profit_pct / stop_loss_pct if stop_loss_pct > 0 else 0
+            log.info(f"[v3.5] 自适应TP/SL: ATR={atr_pct:.5f}% | "
+                     f"SL={stop_loss_pct*100:.3f}% ({sl_mult_str}) | "
+                     f"TP={take_profit_pct*100:.3f}% ({tp_mult_str}) | "
+                     f"实际R/R={effective_rr:.2f} | 方向={direction}")
+        else:
+            # 原有逻辑: 动态止损(基于spread) + 固定R/R
+            if self.config.dynamic_stop_loss:
+                dynamic_stop = spread_pct * self.config.stop_loss_spread_multiplier
+                stop_loss_pct = max(self.config.dynamic_stop_loss_min, min(dynamic_stop, self.config.dynamic_stop_loss_max))
+                log.info(f"[开仓] 动态止损={stop_loss_pct*100:.2f}% (spread={spread_pct:.4f}% x {self.config.stop_loss_spread_multiplier}, 范围={self.config.dynamic_stop_loss_min*100:.1f}%-{self.config.dynamic_stop_loss_max*100:.1f}%)")
+            else:
+                stop_loss_pct = self.config.stop_loss_pct
+
+            take_profit_pct = stop_loss_pct * self.config.risk_reward_ratio
+            log.info(f"[开仓] 止盈={take_profit_pct*100:.2f}%, 止损={stop_loss_pct*100:.2f}% (R/R={self.config.risk_reward_ratio})")
 
         # 执行交易
         success, exit_reason, pnl = await self._execute_trade(
@@ -1719,6 +1872,19 @@ class RPIBot:
             log.info(f"  - 退出窗口: timeout前{self.config.maker_exit_window}s挂限价平仓单")
             log.info(f"  - Grace period: {self.config.maker_exit_grace}s")
             log.info(f"  - 价格偏移: {self.config.maker_exit_price_offset} ticks")
+        log.info("")
+        log.info("v3.5 功能:")
+        log.info(f"  - 自适应止盈止损: {'开启' if self.config.adaptive_stoploss else '关闭'}")
+        if self.config.adaptive_stoploss:
+            log.info(f"  - ATR窗口: {self.config.atr_window}采样 × {self.config.atr_sample_interval}s")
+            log.info(f"  - 做多: SL=ATR×{self.config.long_sl_atr_mult}, TP=ATR×{self.config.long_tp_atr_mult}")
+            log.info(f"  - 做空: SL=ATR×{self.config.short_sl_atr_mult}, TP=ATR×{self.config.short_tp_atr_mult}")
+            log.info(f"  - SL钳位: {self.config.adaptive_sl_min*100:.1f}%-{self.config.adaptive_sl_max*100:.1f}%")
+            log.info(f"  - TP钳位: {self.config.adaptive_tp_min*100:.1f}%-{self.config.adaptive_tp_max*100:.1f}%")
+        long_thresh = self.config.long_signal_threshold if self.config.long_signal_threshold > 0 else self.config.direction_signal_threshold
+        short_thresh = self.config.short_signal_threshold if self.config.short_signal_threshold > 0 else self.config.direction_signal_threshold
+        if long_thresh != short_thresh:
+            log.info(f"  - 多空独立信号阈值: 做多>{long_thresh}, 做空<-{short_thresh}")
         log.info("=" * 60)
 
         if not await self.client.authenticate_interactive():
@@ -1883,6 +2049,25 @@ def print_final_config(config: RPIConfig):
     log.info(f"  price_momentum_window: {config.price_momentum_window}")
     log.info(f"  price_momentum_min_slope: {config.price_momentum_min_slope}%")
     log.info("")
+    log.info("[v3.5 自适应止盈止损]")
+    log.info(f"  adaptive_stoploss: {config.adaptive_stoploss}")
+    log.info(f"  atr_window: {config.atr_window}")
+    log.info(f"  atr_sample_interval: {config.atr_sample_interval}s")
+    log.info(f"  long_sl_atr_mult: {config.long_sl_atr_mult}")
+    log.info(f"  long_tp_atr_mult: {config.long_tp_atr_mult}")
+    log.info(f"  short_sl_atr_mult: {config.short_sl_atr_mult}")
+    log.info(f"  short_tp_atr_mult: {config.short_tp_atr_mult}")
+    log.info(f"  adaptive_sl_min: {config.adaptive_sl_min*100:.2f}%")
+    log.info(f"  adaptive_sl_max: {config.adaptive_sl_max*100:.2f}%")
+    log.info(f"  adaptive_tp_min: {config.adaptive_tp_min*100:.2f}%")
+    log.info(f"  adaptive_tp_max: {config.adaptive_tp_max*100:.2f}%")
+    log.info("")
+    log.info("[v3.5 多空独立阈值]")
+    log.info(f"  long_signal_threshold: {config.long_signal_threshold} (0=使用统一值{config.direction_signal_threshold})")
+    log.info(f"  short_signal_threshold: {config.short_signal_threshold} (0=使用统一值{config.direction_signal_threshold})")
+    log.info(f"  rsi_long_threshold: {config.rsi_long_threshold} (0=使用统一值{config.rsi_trend_threshold})")
+    log.info(f"  rsi_short_threshold: {config.rsi_short_threshold} (0=使用统一值{config.rsi_trend_threshold})")
+    log.info("")
     log.info("[v3.4 Maker优先退出]")
     log.info(f"  maker_exit_enabled: {config.maker_exit_enabled}")
     log.info(f"  maker_exit_window: {config.maker_exit_window}s")
@@ -1960,6 +2145,25 @@ async def main():
     config.market_spread_limit_pct = float(os.getenv("MARKET_SPREAD_LIMIT_PCT", "0.006"))
     config.exit_post_only = os.getenv("EXIT_POST_ONLY", "true").lower() == "true"
     config.exit_price_offset_ticks = int(os.getenv("EXIT_PRICE_OFFSET_TICKS", "0"))
+
+    # v3.5 自适应止盈止损
+    config.adaptive_stoploss = os.getenv("ADAPTIVE_STOPLOSS", "false").lower() == "true"
+    config.atr_window = int(os.getenv("ATR_WINDOW", "25"))
+    config.atr_sample_interval = float(os.getenv("ATR_SAMPLE_INTERVAL", "0.3"))
+    config.long_sl_atr_mult = float(os.getenv("LONG_SL_ATR_MULT", "1.2"))
+    config.long_tp_atr_mult = float(os.getenv("LONG_TP_ATR_MULT", "1.8"))
+    config.short_sl_atr_mult = float(os.getenv("SHORT_SL_ATR_MULT", "1.0"))
+    config.short_tp_atr_mult = float(os.getenv("SHORT_TP_ATR_MULT", "2.2"))
+    config.adaptive_sl_min = float(os.getenv("ADAPTIVE_SL_MIN", "0.005"))
+    config.adaptive_sl_max = float(os.getenv("ADAPTIVE_SL_MAX", "0.020"))
+    config.adaptive_tp_min = float(os.getenv("ADAPTIVE_TP_MIN", "0.008"))
+    config.adaptive_tp_max = float(os.getenv("ADAPTIVE_TP_MAX", "0.040"))
+
+    # v3.5 多空独立阈值
+    config.long_signal_threshold = float(os.getenv("LONG_SIGNAL_THRESHOLD", "0"))
+    config.short_signal_threshold = float(os.getenv("SHORT_SIGNAL_THRESHOLD", "0"))
+    config.rsi_long_threshold = float(os.getenv("RSI_LONG_THRESHOLD", "0"))
+    config.rsi_short_threshold = float(os.getenv("RSI_SHORT_THRESHOLD", "0"))
 
     # v3.4 Maker优先退出配置
     config.maker_exit_enabled = os.getenv("MAKER_EXIT_ENABLED", "true").lower() == "true"
