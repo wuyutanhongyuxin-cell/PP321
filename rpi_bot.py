@@ -170,13 +170,13 @@ class RPIConfig:
     atr_window: int = 25
     atr_sample_interval: float = 0.3
 
-    # 做多 ATR 倍数
-    long_sl_atr_mult: float = 1.2
-    long_tp_atr_mult: float = 1.8
+    # 做多 ATR 倍数 (ATR已缩放到持仓级别，倍数控制相对ATR的宽度)
+    long_sl_atr_mult: float = 8.0
+    long_tp_atr_mult: float = 15.0
 
     # 做空 ATR 倍数
-    short_sl_atr_mult: float = 1.0
-    short_tp_atr_mult: float = 2.2
+    short_sl_atr_mult: float = 7.0
+    short_tp_atr_mult: float = 18.0
 
     # 自适应钳位
     adaptive_sl_min: float = 0.005
@@ -779,20 +779,28 @@ class RPIBot:
     async def _calculate_atr(self, market: str, n_samples: int = 25,
                               sample_interval: float = 0.3) -> Optional[float]:
         """
-        计算 ATR (Average True Range) 百分比
+        计算持仓级别的波动率指标 (ATR百分比)
 
-        基于连续BBO快照计算，不依赖外部K线API。
-        每个采样点取 mid_price = (bid+ask)/2，
-        TR = |current_mid - prev_mid| (简化版，tick级别无high/low)
-        ATR = mean(TR) / mean(price) * 100  → 百分比
+        方法:
+            1. 采集 n_samples 个BBO快照 (间隔 sample_interval 秒)
+            2. 将采样点分成若干子窗口 (每窗口 candle_size 个点)
+            3. 计算每个子窗口的 high-low range
+            4. 取 range 的平均值
+            5. 用 sqrt(持仓时间/子窗口时间) 缩放到持仓级别
+
+        优点 (相比逐tick TR均值):
+            - 子窗口range天然抗零膨胀 (5个点里只要1个变了就>0)
+            - 多个子窗口的统计量更稳定
+            - sqrt缩放有随机游走理论依据
 
         Args:
             market: 交易市场
-            n_samples: 采样点数 (默认25，约7.5秒)
-            sample_interval: 采样间隔秒数
+            n_samples: 采样点数 (默认25)
+            sample_interval: 采样间隔秒数 (默认0.3)
 
         Returns:
-            ATR百分比 (如 0.005 表示 0.005%)，或 None
+            ATR百分比 (已缩放到持仓级别)，如 0.06 表示 0.06%
+            返回 None 表示采样失败
         """
         prices = []
         for i in range(n_samples):
@@ -803,27 +811,38 @@ class RPIBot:
             if i < n_samples - 1:
                 await asyncio.sleep(sample_interval)
 
-        if len(prices) < 5:
+        if len(prices) < 10:
             return None
 
-        # 计算 True Range 序列
-        true_ranges = []
-        for i in range(1, len(prices)):
-            tr = abs(prices[i] - prices[i - 1])
-            true_ranges.append(tr)
+        # 分成子窗口 (每窗口5个采样点)
+        candle_size = 5
+        candle_ranges = []
+        for i in range(0, len(prices) - candle_size + 1, candle_size):
+            window = prices[i:i + candle_size]
+            candle_range = max(window) - min(window)
+            candle_ranges.append(candle_range)
 
-        if not true_ranges:
+        if not candle_ranges:
             return None
 
-        atr = sum(true_ranges) / len(true_ranges)
+        avg_range = sum(candle_ranges) / len(candle_ranges)
         avg_price = sum(prices) / len(prices)
 
         if avg_price == 0:
             return None
 
-        atr_pct = atr / avg_price * 100  # 转为百分比
+        # 缩放到持仓时间级别 (随机游走: 波动 ∝ sqrt(时间))
+        candle_seconds = candle_size * sample_interval           # 1.5s per candle
+        holding_seconds = self.config.max_wait_seconds           # 60s
+        scale = (holding_seconds / candle_seconds) ** 0.5        # sqrt(40) ≈ 6.3
 
-        # 同时更新 price_history 供 RSI 等使用
+        atr_pct = (avg_range / avg_price) * 100 * scale
+
+        log.info(f"[ATR] 子窗口数={len(candle_ranges)}, avg_range=${avg_range:.2f}, "
+                 f"scale=sqrt({holding_seconds:.0f}/{candle_seconds:.1f})={scale:.2f}, "
+                 f"atr_pct={atr_pct:.5f}%")
+
+        # 更新 price_history 供 RSI 等使用
         self.price_history.extend(prices)
         if len(self.price_history) > 100:
             self.price_history = self.price_history[-100:]
@@ -1587,8 +1606,8 @@ class RPIBot:
                     return False, f"波动率过高: {volatility:.4f}%"
                 bid = vol_data["latest_price"]
                 self.price_history.extend(vol_data["prices"])
-                if len(self.price_history) > 50:
-                    self.price_history = self.price_history[-50:]
+                if len(self.price_history) > 100:
+                    self.price_history = self.price_history[-100:]
                 new_bbo = await self.client.get_bbo(market)
                 if new_bbo:
                     ask = new_bbo["ask"]
@@ -1596,34 +1615,22 @@ class RPIBot:
         # v3.5 ATR 采样 (自适应止盈止损)
         atr_pct = None
         if self.config.adaptive_stoploss:
-            if self.config.volatility_filter_enabled:
-                # 波动率检测已经采样了价格，用 price_history 计算 ATR（避免重复采样）
-                if len(self.price_history) >= 5:
-                    recent = self.price_history[-self.config.atr_window:]
-                    trs = [abs(recent[i] - recent[i-1]) for i in range(1, len(recent))]
-                    if trs:
-                        avg_price = sum(recent) / len(recent)
-                        atr_pct = (sum(trs) / len(trs)) / avg_price * 100 if avg_price > 0 else None
-                if atr_pct is not None:
-                    log.info(f"[ATR] 从波动率采样数据计算: ATR={atr_pct:.5f}% (样本={min(len(self.price_history), self.config.atr_window)})")
+            # 始终独立采样 ATR (不复用 price_history，避免采样间隔不均匀导致 ATR 失真)
+            log.info(f"[ATR] 采样中 (窗口={self.config.atr_window}, 间隔={self.config.atr_sample_interval}s)")
+            atr_pct = await self._calculate_atr(
+                market,
+                n_samples=self.config.atr_window,
+                sample_interval=self.config.atr_sample_interval
+            )
+            if atr_pct is not None:
+                log.info(f"[ATR] 采样完成: ATR={atr_pct:.5f}%")
+            else:
+                log.warning("[ATR] 采样失败，本周期回退到固定止盈止损")
 
-            if atr_pct is None:
-                # 波动率检测关闭或数据不足，独立采样
-                log.info(f"[ATR] 独立采样中 (窗口={self.config.atr_window}, 间隔={self.config.atr_sample_interval}s)")
-                atr_pct = await self._calculate_atr(
-                    market,
-                    n_samples=self.config.atr_window,
-                    sample_interval=self.config.atr_sample_interval
-                )
-                if atr_pct is not None:
-                    log.info(f"[ATR] 独立采样完成: ATR={atr_pct:.5f}%")
-                else:
-                    log.warning("[ATR] 采样失败，本周期回退到固定止盈止损")
-
-                # 独立采样后需要刷新 BBO（价格可能已变化）
-                new_bbo = await self.client.get_bbo(market)
-                if new_bbo:
-                    bid, ask = new_bbo["bid"], new_bbo["ask"]
+            # 采样后刷新 BBO（价格可能已变化）
+            new_bbo = await self.client.get_bbo(market)
+            if new_bbo:
+                bid, ask = new_bbo["bid"], new_bbo["ask"]
 
         # 获取方向信号
         imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
@@ -2150,10 +2157,10 @@ async def main():
     config.adaptive_stoploss = os.getenv("ADAPTIVE_STOPLOSS", "false").lower() == "true"
     config.atr_window = int(os.getenv("ATR_WINDOW", "25"))
     config.atr_sample_interval = float(os.getenv("ATR_SAMPLE_INTERVAL", "0.3"))
-    config.long_sl_atr_mult = float(os.getenv("LONG_SL_ATR_MULT", "1.2"))
-    config.long_tp_atr_mult = float(os.getenv("LONG_TP_ATR_MULT", "1.8"))
-    config.short_sl_atr_mult = float(os.getenv("SHORT_SL_ATR_MULT", "1.0"))
-    config.short_tp_atr_mult = float(os.getenv("SHORT_TP_ATR_MULT", "2.2"))
+    config.long_sl_atr_mult = float(os.getenv("LONG_SL_ATR_MULT", "8.0"))
+    config.long_tp_atr_mult = float(os.getenv("LONG_TP_ATR_MULT", "15.0"))
+    config.short_sl_atr_mult = float(os.getenv("SHORT_SL_ATR_MULT", "7.0"))
+    config.short_tp_atr_mult = float(os.getenv("SHORT_TP_ATR_MULT", "18.0"))
     config.adaptive_sl_min = float(os.getenv("ADAPTIVE_SL_MIN", "0.005"))
     config.adaptive_sl_max = float(os.getenv("ADAPTIVE_SL_MAX", "0.020"))
     config.adaptive_tp_min = float(os.getenv("ADAPTIVE_TP_MIN", "0.008"))
