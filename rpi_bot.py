@@ -26,6 +26,14 @@ v3.3 新增功能 (Maker优先):
     - 平仓也支持Maker优先 (非止损情况)
     - 增强日志: 区分Maker/Taker入场与退出
 
+v3.4 新增功能 (Maker优先退出):
+    - timeout前提前挂限价平仓单 (Phase 1: Maker退出窗口)
+    - 限价单成交 = Maker出场, 未成交 = Grace period后Taker兜底
+    - 部分成交处理: 取消剩余, 市价平掉未成交部分
+    - 止盈止损优先级高于Maker退出 (触发时立即取消限价单)
+    - 完整的exit_reason追踪和出场Maker率统计
+    - 可配置: MAKER_EXIT_ENABLED开关支持A/B测试
+
 基于 pp2 项目改进: https://github.com/wuyutanhongyuxin-cell/pp2
 """
 
@@ -149,6 +157,12 @@ class RPIConfig:
     drawdown_control_enabled: bool = True
     max_daily_loss_pct: float = 0.03
     max_total_loss_pct: float = 0.10
+
+    # ===== v3.4 Maker优先退出配置 =====
+    maker_exit_enabled: bool = True
+    maker_exit_window: float = 10.0
+    maker_exit_grace: float = 2.0
+    maker_exit_price_offset: int = 0
 
     # ===== v3.1 做空交易配置 =====
     enable_short: bool = True
@@ -419,6 +433,21 @@ class ParadexInteractiveClient:
             log.error(f"等待成交失败: {e}")
             return None
 
+    async def get_order_status(self, order_id: str) -> Optional[Dict]:
+        """非阻塞查询订单状态，返回订单详情或None"""
+        try:
+            if not await self.ensure_authenticated():
+                return None
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(f"{self.base_url}/orders/{order_id}", headers=self._get_auth_headers()) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+            return None
+        except Exception as e:
+            log.error(f"查询订单状态失败: {e}")
+            return None
+
     async def cancel_order(self, order_id: str) -> bool:
         try:
             import aiohttp
@@ -595,6 +624,11 @@ class RPIBot:
         self.last_position_size: Optional[float] = None
         self.price_history: List[float] = []
 
+        # Maker退出统计
+        self.maker_exit_success: int = 0
+        self.maker_exit_partial: int = 0
+        self.maker_exit_failed: int = 0
+
         if self.account_manager:
             self.rate_state = self.account_manager.get_current_rate_state()
 
@@ -644,8 +678,12 @@ class RPIBot:
         if self.account_manager:
             self.account_manager.save_state()
 
-    def _record_trade_result(self, pnl: float, win: bool, direction: str):
-        self.recent_trades.append({"time": time.time(), "pnl": pnl, "win": win, "direction": direction})
+    def _record_trade_result(self, pnl: float, win: bool, direction: str, exit_reason: str = "",
+                             exit_liquidity: str = ""):
+        self.recent_trades.append({
+            "time": time.time(), "pnl": pnl, "win": win, "direction": direction,
+            "exit_reason": exit_reason, "exit_liquidity": exit_liquidity
+        })
         self.total_pnl += pnl
         if len(self.recent_trades) > 100:
             self.recent_trades = self.recent_trades[-100:]
@@ -1008,6 +1046,11 @@ class RPIBot:
         exit_reason = "timeout"
         breakeven_activated = False
         trailing_activated = False
+        close_side = "SELL" if is_long else "BUY"
+        maker_exit_order_id = None
+        maker_exit_placed = False
+        maker_exit_place_time = 0
+        maker_exit_limit_price = 0.0
 
         if self.config.max_wait_seconds <= 0:
             log.info("[极速] 立即平仓模式")
@@ -1093,6 +1136,45 @@ class RPIBot:
                                 exit_reason = "stop_loss"
                             break
 
+                    # === v3.4 Maker优先退出: 挂限价平仓单 ===
+                    elapsed = time.time() - wait_start
+                    if (self.config.maker_exit_enabled
+                            and not maker_exit_placed
+                            and elapsed >= max_wait - self.config.maker_exit_window):
+                        tick_size = 0.1
+                        if is_long:
+                            maker_exit_limit_price = new_bbo["ask"] + self.config.maker_exit_price_offset * tick_size
+                        else:
+                            maker_exit_limit_price = new_bbo["bid"] - self.config.maker_exit_price_offset * tick_size
+
+                        bbo_key = "ask" if is_long else "bid"
+                        log.info(f"[Maker退出] 挂限价平仓单: {'SELL' if is_long else 'BUY'} {size} BTC @ ${maker_exit_limit_price:.1f} (best_{bbo_key}={new_bbo[bbo_key]:.1f}, offset={self.config.maker_exit_price_offset})")
+
+                        maker_exit_result = await self.client.place_limit_order(
+                            market=market, side=close_side, size=size,
+                            price=str(round(maker_exit_limit_price, 1)),
+                            post_only=True, reduce_only=True
+                        )
+                        maker_exit_placed = True
+                        maker_exit_place_time = time.time()
+                        if maker_exit_result:
+                            maker_exit_order_id = maker_exit_result.get("id")
+                            log.info(f"[Maker退出] 已挂限价平仓单 order_id={maker_exit_order_id}")
+                        else:
+                            log.warning("[Maker退出] 挂单失败，将在timeout后市价平仓")
+
+                    # === v3.4 检查Maker平仓单是否成交 ===
+                    if maker_exit_placed and maker_exit_order_id:
+                        order_info = await self.client.get_order_status(maker_exit_order_id)
+                        if order_info:
+                            order_status = order_info.get("status")
+                            remaining_qty = float(order_info.get("remaining_size", size))
+                            if order_status == "CLOSED" and remaining_qty < 0.00001:
+                                wait_seconds = time.time() - maker_exit_place_time
+                                log.info(f"[Maker退出] 限价平仓单已全部成交 (等待 {wait_seconds:.1f}s)")
+                                exit_reason = "maker_close"
+                                break
+
                     # 智能持仓延长
                     elapsed = time.time() - wait_start
                     remaining = max_wait - elapsed
@@ -1114,64 +1196,128 @@ class RPIBot:
             else:
                 log.info(f"[超时] {max_wait:.0f}s, 价格: ${best_price:.1f}")
 
-        # 平仓
-        close_side = "SELL" if is_long else "BUY"
+        # ===== 平仓处理 =====
         close_result = None
         actual_exit_price = best_price
         is_maker_exit = False
         tick_size = 0.1
 
-        # ===== v3.3 Maker优先平仓 (非紧急止损情况) =====
-        if self.config.exit_order_type == "limit" and exit_reason not in ["stop_loss", "trailing_stop", "shutdown"]:
-            # 获取最新BBO用于挂单
-            exit_bbo = await self.client.get_bbo(market)
-            if exit_bbo:
-                # 做多平仓用ask挂卖单, 做空平仓用bid挂买单 (确保Maker)
-                if is_long:
-                    exit_limit_price = exit_bbo["ask"] + self.config.exit_price_offset_ticks * tick_size
+        # Phase A: 处理v3.4 Maker退出订单
+        maker_filled_size = 0.0
+        maker_filled_price = 0.0
+
+        if maker_exit_order_id:
+            if exit_reason == "maker_close":
+                # Maker平仓已全部成交，查询订单详情获取实际成交价
+                order_info = await self.client.get_order_status(maker_exit_order_id)
+                if order_info:
+                    actual_exit_price = float(order_info.get("avg_fill_price", maker_exit_limit_price))
+                    close_result = order_info
                 else:
-                    exit_limit_price = exit_bbo["bid"] - self.config.exit_price_offset_ticks * tick_size
+                    actual_exit_price = maker_exit_limit_price
+                    close_result = {"status": "CLOSED"}
+                is_maker_exit = True
+                self.maker_exit_success += 1
             else:
-                exit_limit_price = best_price
+                # TP/SL/shutdown/timeout触发，取消Maker退出单
+                log.info(f"[Maker退出] {exit_reason}触发，取消限价平仓单")
+                await self.client.cancel_order(maker_exit_order_id)
+                # 查询取消后的订单状态（可能已部分成交）
+                order_info = await self.client.get_order_status(maker_exit_order_id)
+                if order_info:
+                    original_qty = float(order_info.get("size", size))
+                    remaining_qty = float(order_info.get("remaining_size", size))
+                    maker_filled_size = original_qty - remaining_qty
+                    if maker_filled_size >= 0.00001:
+                        maker_filled_price = float(order_info.get("avg_fill_price", maker_exit_limit_price))
+                        log.info(f"[Maker退出] 取消时已部分成交 {maker_filled_size:.5f}/{size} BTC @ ${maker_filled_price:.1f}")
 
-            log.info(f"[平仓] Maker优先: 限价{'卖出' if is_long else '买入'} {size} BTC @ ${exit_limit_price:.1f} (offset={self.config.exit_price_offset_ticks})")
-            limit_result = await self.client.place_limit_order(
-                market=market, side=close_side, size=size,
-                price=str(round(exit_limit_price, 1)),
-                post_only=self.config.exit_post_only,
-                reduce_only=True
-            )
-            if limit_result:
-                fill = await self.client.wait_order_fill(limit_result.get("id"), timeout_seconds=5.0)
-                if fill:
-                    close_result = fill
-                    actual_exit_price = float(fill.get("avg_fill_price", exit_limit_price))
+                # 取消时可能已全部成交
+                remaining_close_size = float(size) - maker_filled_size
+                if remaining_close_size < 0.00001:
+                    log.info(f"[Maker退出] 取消时发现已全部成交")
+                    actual_exit_price = maker_filled_price if maker_filled_price > 0 else maker_exit_limit_price
+                    close_result = order_info or {"status": "CLOSED"}
                     is_maker_exit = True
-                    log.info(f"  -> [Maker] 限价单成交 @ ${actual_exit_price:.1f}")
-                else:
-                    log.info("  -> 限价单超时未成交，切换Taker平仓")
+                    exit_reason = "maker_close"
+                    self.maker_exit_success += 1
 
-        # Taker市价单平仓 (fallback或紧急止损)
-        if not close_result:
-            exit_type_reason = "止损/追踪止损" if exit_reason in ["stop_loss", "trailing_stop"] else "Maker超时"
-            log.info(f"[平仓] Taker: 市价{'卖出' if is_long else '买入'} {size} BTC @ 约${best_price:.1f} ({exit_type_reason})")
-            close_result = await self.client.place_market_order(market=market, side=close_side, size=size, reduce_only=True)
+        # Phase B: 平仓剩余部分
+        remaining_close_size = float(size) - maker_filled_size
 
-        # 兜底平仓 - 从API获取实际持仓大小
-        if not close_result:
-            positions = await self.client.get_positions(market)
-            if positions:
-                actual_size = positions[0].get("size", size)
-                # 验证size有效性
-                try:
-                    size_float = float(actual_size)
-                    if size_float >= 0.00001:
-                        log.info(f"[平仓] 兜底: 市价单 {close_side} {actual_size} BTC")
-                        close_result = await self.client.place_market_order(market=market, side=close_side, size=str(actual_size), reduce_only=True)
+        if remaining_close_size >= 0.00001 and not close_result:
+            remaining_close_str = str(round(remaining_close_size, 5))
+
+            # v3.3 原有Maker优先平仓 (仅在v3.4 Maker退出未启用/未挂单且非紧急情况时)
+            if (not maker_exit_placed
+                    and self.config.exit_order_type == "limit"
+                    and exit_reason not in ["stop_loss", "trailing_stop", "shutdown"]):
+                exit_bbo = await self.client.get_bbo(market)
+                if exit_bbo:
+                    if is_long:
+                        exit_limit_price = exit_bbo["ask"] + self.config.exit_price_offset_ticks * tick_size
                     else:
-                        log.info(f"[平仓] 持仓已平完 (size={actual_size})")
-                except (ValueError, TypeError):
-                    log.warning(f"[平仓] 无效的持仓大小: {actual_size}")
+                        exit_limit_price = exit_bbo["bid"] - self.config.exit_price_offset_ticks * tick_size
+                else:
+                    exit_limit_price = best_price
+
+                log.info(f"[平仓] Maker优先: 限价{'卖出' if is_long else '买入'} {remaining_close_str} BTC @ ${exit_limit_price:.1f} (offset={self.config.exit_price_offset_ticks})")
+                limit_result = await self.client.place_limit_order(
+                    market=market, side=close_side, size=remaining_close_str,
+                    price=str(round(exit_limit_price, 1)),
+                    post_only=self.config.exit_post_only, reduce_only=True
+                )
+                if limit_result:
+                    fill = await self.client.wait_order_fill(limit_result.get("id"), timeout_seconds=5.0)
+                    if fill:
+                        close_result = fill
+                        actual_exit_price = float(fill.get("avg_fill_price", exit_limit_price))
+                        is_maker_exit = True
+                        log.info(f"  -> [Maker] 限价单成交 @ ${actual_exit_price:.1f}")
+                    else:
+                        log.info("  -> 限价单超时未成交，切换Taker平仓")
+
+            # v3.4 Maker退出部分成交/未成交 → Grace period + Taker兜底
+            if not close_result and maker_exit_placed:
+                if self.config.maker_exit_grace > 0:
+                    log.info(f"[Maker退出] 等待 {self.config.maker_exit_grace}s (grace period)")
+                    await asyncio.sleep(self.config.maker_exit_grace)
+
+                wait_seconds = time.time() - maker_exit_place_time if maker_exit_place_time > 0 else 0
+                if maker_filled_size >= 0.00001:
+                    log.info(f"[Maker退出] 部分成交 {maker_filled_size:.5f}/{size}, 剩余 {remaining_close_str} 市价平仓")
+                    exit_reason = "maker_partial_then_taker"
+                    self.maker_exit_partial += 1
+                else:
+                    log.info(f"[Maker退出] 限价平仓单未成交 (等待 {wait_seconds:.1f}s), 市价平仓")
+                    exit_reason = "maker_failed_taker_fallback"
+                    self.maker_exit_failed += 1
+
+            # Taker市价单平仓 (fallback或紧急止损)
+            if not close_result:
+                exit_type_reason = ("止损/追踪止损" if exit_reason in ["stop_loss", "trailing_stop"]
+                                    else "Maker退出失败" if maker_exit_placed
+                                    else "超时")
+                log.info(f"[平仓] Taker: 市价{'卖出' if is_long else '买入'} {remaining_close_str} BTC @ 约${best_price:.1f} ({exit_type_reason})")
+                close_result = await self.client.place_market_order(market=market, side=close_side, size=remaining_close_str, reduce_only=True)
+                if close_result and maker_filled_size >= 0.00001:
+                    taker_price = float(close_result.get("avg_fill_price", best_price)) if close_result.get("avg_fill_price") else best_price
+                    actual_exit_price = (maker_filled_price * maker_filled_size + taker_price * remaining_close_size) / float(size)
+
+            # 兜底平仓 - 从API获取实际持仓大小
+            if not close_result:
+                positions = await self.client.get_positions(market)
+                if positions:
+                    actual_size = positions[0].get("size", remaining_close_str)
+                    try:
+                        size_float = float(actual_size)
+                        if size_float >= 0.00001:
+                            log.info(f"[平仓] 兜底: 市价单 {close_side} {actual_size} BTC")
+                            close_result = await self.client.place_market_order(market=market, side=close_side, size=str(actual_size), reduce_only=True)
+                        else:
+                            log.info(f"[平仓] 持仓已平完 (size={actual_size})")
+                    except (ValueError, TypeError):
+                        log.warning(f"[平仓] 无效的持仓大小: {actual_size}")
 
         # 计算盈亏
         pnl = 0.0
@@ -1192,8 +1338,9 @@ class RPIBot:
 
             is_win = pnl > 0
             direction_cn = "多" if is_long else "空"
-            log.info(f"  -> [{direction_cn}仓] PnL: ${pnl:.4f} ({pnl_pct:+.4f}%) | 出场: {exit_reason}")
-            self._record_trade_result(pnl, is_win, direction)
+            exit_liq = "MAKER" if is_maker_exit else "TAKER"
+            log.info(f"  -> [{direction_cn}仓] PnL: ${pnl:.4f} ({pnl_pct:+.4f}%) | 出场: {exit_reason} ({exit_liq})")
+            self._record_trade_result(pnl, is_win, direction, exit_reason=exit_reason, exit_liquidity=exit_liq)
         else:
             log.warning("  -> 平仓失败")
 
@@ -1416,8 +1563,14 @@ class RPIBot:
         # 统计输出
         rpi_rate = (self.rpi_trades / self.total_trades * 100) if self.total_trades > 0 else 0
         win_rate = sum(1 for t in self.recent_trades if t["win"]) / len(self.recent_trades) * 100 if self.recent_trades else 0
+        maker_exit_total = self.maker_exit_success + self.maker_exit_partial + self.maker_exit_failed
+        maker_exit_rate = (self.maker_exit_success / maker_exit_total * 100) if maker_exit_total > 0 else 0
         log.info(f"[统计] 交易: {self.total_trades} (多:{self.long_trades}/空:{self.short_trades}) | "
                  f"RPI: {self.rpi_trades} ({rpi_rate:.1f}%) | 胜率: {win_rate:.1f}% | PnL: ${self.total_pnl:.4f}")
+        if maker_exit_total > 0:
+            log.info(f"[统计] Maker退出: maker_close={self.maker_exit_success}, "
+                     f"taker_fallback={self.maker_exit_failed}, partial={self.maker_exit_partial} | "
+                     f"出场Maker率: {maker_exit_rate:.1f}%")
 
         return success, f"周期完成 ({exit_reason})"
 
@@ -1462,7 +1615,7 @@ class RPIBot:
         self.start_time = time.time()
 
         log.info("=" * 60)
-        log.info("RPI Bot v3.3 - Maker优先版")
+        log.info("RPI Bot v3.4 - Maker优先退出版")
         log.info("=" * 60)
         log.info(f"市场: {self.config.market}")
         log.info(f"交易大小: {self.config.trade_size} BTC")
@@ -1475,6 +1628,13 @@ class RPIBot:
         log.info(f"  - 做空交易: {'开启' if self.config.enable_short else '关闭'}")
         log.info(f"  - 追踪止损: {'开启' if self.config.trailing_stop_enabled else '关闭'}")
         log.info(f"  - 方向一致性过滤: {'开启' if self.config.direction_trend_confirm else '关闭'}")
+        log.info("")
+        log.info("v3.4 功能:")
+        log.info(f"  - Maker优先退出: {'开启' if self.config.maker_exit_enabled else '关闭'}")
+        if self.config.maker_exit_enabled:
+            log.info(f"  - 退出窗口: timeout前{self.config.maker_exit_window}s挂限价平仓单")
+            log.info(f"  - Grace period: {self.config.maker_exit_grace}s")
+            log.info(f"  - 价格偏移: {self.config.maker_exit_price_offset} ticks")
         log.info("=" * 60)
 
         if not await self.client.authenticate_interactive():
@@ -1525,6 +1685,11 @@ class RPIBot:
         log.info(f"总交易: {self.total_trades} (做多: {self.long_trades}, 做空: {self.short_trades})")
         log.info(f"RPI: {self.rpi_trades} ({self.rpi_trades/self.total_trades*100:.1f}%)" if self.total_trades else "RPI: 0")
         log.info(f"累计PnL: ${self.total_pnl:.4f}")
+        maker_exit_total = self.maker_exit_success + self.maker_exit_partial + self.maker_exit_failed
+        if maker_exit_total > 0:
+            maker_exit_rate = self.maker_exit_success / maker_exit_total * 100
+            log.info(f"Maker退出: maker_close={self.maker_exit_success}, taker_fallback={self.maker_exit_failed}, "
+                     f"partial={self.maker_exit_partial} | 出场Maker率: {maker_exit_rate:.1f}%")
         log.info("=" * 60)
 
         if self.account_manager:
@@ -1634,6 +1799,12 @@ def print_final_config(config: RPIConfig):
     log.info(f"  price_momentum_window: {config.price_momentum_window}")
     log.info(f"  price_momentum_min_slope: {config.price_momentum_min_slope}%")
     log.info("")
+    log.info("[v3.4 Maker优先退出]")
+    log.info(f"  maker_exit_enabled: {config.maker_exit_enabled}")
+    log.info(f"  maker_exit_window: {config.maker_exit_window}s")
+    log.info(f"  maker_exit_grace: {config.maker_exit_grace}s")
+    log.info(f"  maker_exit_price_offset: {config.maker_exit_price_offset} ticks")
+    log.info("")
     log.info("=" * 60)
 
 
@@ -1705,6 +1876,17 @@ async def main():
     config.market_spread_limit_pct = float(os.getenv("MARKET_SPREAD_LIMIT_PCT", "0.006"))
     config.exit_post_only = os.getenv("EXIT_POST_ONLY", "true").lower() == "true"
     config.exit_price_offset_ticks = int(os.getenv("EXIT_PRICE_OFFSET_TICKS", "0"))
+
+    # v3.4 Maker优先退出配置
+    config.maker_exit_enabled = os.getenv("MAKER_EXIT_ENABLED", "true").lower() == "true"
+    config.maker_exit_window = float(os.getenv("MAKER_EXIT_WINDOW", "10"))
+    config.maker_exit_grace = float(os.getenv("MAKER_EXIT_GRACE", "2"))
+    config.maker_exit_price_offset = int(os.getenv("MAKER_EXIT_PRICE_OFFSET", "0"))
+
+    # 校验: MAKER_EXIT_WINDOW 必须小于 MAX_WAIT_SECONDS
+    if config.maker_exit_enabled and config.maker_exit_window >= config.max_wait_seconds:
+        log.error(f"配置错误: MAKER_EXIT_WINDOW ({config.maker_exit_window}s) 必须小于 MAX_WAIT_SECONDS ({config.max_wait_seconds}s)")
+        sys.exit(1)
 
     config.direction_trend_confirm = os.getenv("DIRECTION_TREND_CONFIRM", "true").lower() == "true"
     config.price_momentum_window = int(os.getenv("PRICE_MOMENTUM_WINDOW", "6"))
