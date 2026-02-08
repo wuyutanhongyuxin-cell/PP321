@@ -1214,8 +1214,12 @@ class RPIBot:
                                             original_qty = float(cancel_check.get("size", size))
                                             cancel_filled = original_qty - cancel_remaining
                                             if cancel_filled >= 0.00001:
+                                                new_fill_price = float(cancel_check.get("avg_fill_price", maker_exit_limit_price))
+                                                if maker_filled_size >= 0.00001 and maker_filled_price > 0:
+                                                    maker_filled_price = (maker_filled_price * maker_filled_size + new_fill_price * cancel_filled) / (maker_filled_size + cancel_filled)
+                                                else:
+                                                    maker_filled_price = new_fill_price
                                                 maker_filled_size += cancel_filled
-                                                maker_filled_price = float(cancel_check.get("avg_fill_price", maker_exit_limit_price))
 
                                         # 重新挂单（用剩余数量）
                                         remaining_to_close = float(size) - maker_filled_size
@@ -1262,9 +1266,6 @@ class RPIBot:
         tick_size = 0.1
 
         # Phase A: 处理v3.4 Maker退出订单
-        maker_filled_size = 0.0
-        maker_filled_price = 0.0
-
         if maker_exit_order_id:
             if exit_reason == "maker_close":
                 # Maker平仓已全部成交，查询订单详情获取实际成交价
@@ -1294,7 +1295,7 @@ class RPIBot:
                     order_status = order_info.get("status")
                     original_qty = float(order_info.get("size", size))
                     remaining_qty = float(order_info.get("remaining_size", size))
-                    maker_filled_size = original_qty - remaining_qty
+                    phase_a_filled = original_qty - remaining_qty
 
                     # 取消失败且订单仍在，强制重试
                     if order_status == "OPEN":
@@ -1304,11 +1305,16 @@ class RPIBot:
                         order_info = await self.client.get_order_status(maker_exit_order_id)
                         if order_info:
                             remaining_qty = float(order_info.get("remaining_size", size))
-                            maker_filled_size = original_qty - remaining_qty
+                            phase_a_filled = original_qty - remaining_qty
 
-                    if maker_filled_size >= 0.00001:
-                        maker_filled_price = float(order_info.get("avg_fill_price", maker_exit_limit_price))
-                        log.info(f"[Maker退出] 取消时已部分成交 {maker_filled_size:.5f}/{size} BTC @ ${maker_filled_price:.1f}")
+                    if phase_a_filled >= 0.00001:
+                        phase_a_price = float(order_info.get("avg_fill_price", maker_exit_limit_price))
+                        if maker_filled_size >= 0.00001 and maker_filled_price > 0:
+                            maker_filled_price = (maker_filled_price * maker_filled_size + phase_a_price * phase_a_filled) / (maker_filled_size + phase_a_filled)
+                        else:
+                            maker_filled_price = phase_a_price
+                        maker_filled_size += phase_a_filled
+                        log.info(f"[Maker退出] Phase A成交 {phase_a_filled:.5f} BTC @ ${phase_a_price:.1f}, 累计Maker成交 {maker_filled_size:.5f}/{size} BTC @ ${maker_filled_price:.1f}")
 
                 # 取消时可能已全部成交
                 remaining_close_size = float(size) - maker_filled_size
